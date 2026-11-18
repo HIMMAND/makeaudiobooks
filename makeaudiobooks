@@ -1,0 +1,588 @@
+#!/usr/bin/env python3
+"""makeaudiobooks: turn a PDF / EPUB / TXT into an M4B audiobook with a local TTS model on your Mac.
+
+  ./makeaudiobooks doctor                 check this Mac, pick a model, show download size + ETA
+  ./makeaudiobooks setup                  install the Python env + model (asks first)
+  ./makeaudiobooks convert book.pdf       make the audiobook (resumable; Ctrl-C any time)
+  ./makeaudiobooks convert book.pdf --dry-run      show chapters, speakers, ETA; synthesize nothing
+"""
+import argparse, collections, hashlib, html, json, os, platform, re, shutil, subprocess, sys, time, wave, zipfile
+
+ROOT = os.path.dirname(os.path.realpath(__file__))
+HOME = os.path.expanduser(os.environ.get("MAKEAUDIOBOOKS_HOME", "~/.makeaudiobooks"))
+VENV_PY = f"{HOME}/venv/bin/python"
+SR = 24000
+MLX_AUDIO = "mlx-audio==0.6.6"
+DEPS_GB = 1.2  # mlx + mlx-audio + deps in the venv (measured)
+# Speeds measured on an M5 / 16 GB MacBook while another TTS job was running, so conservative.
+# `doctor --bench` measures your Mac and overrides these.
+MODELS = {
+    "qwen-1.7b": dict(repo="mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16", gb=4.2, cps=31, chunk=500,
+                      about="Qwen3-TTS 1.7B: best quality, voice cloning (needs ~11 GB free RAM)"),
+    "qwen-0.6b": dict(repo="mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit", gb=2.0, cps=38, chunk=500,
+                      about="Qwen3-TTS 0.6B: great quality, voice cloning (~8 GB RAM)"),
+    "kokoro": dict(repo="mlx-community/Kokoro-82M-bf16", gb=0.4, cps=140, chunk=1200,
+                   about="Kokoro 82M: fast, lighter quality, preset voices only"),
+}
+# Narrator first, then one voice per detected speaker. Reference clips in voices/ were made with Kokoro
+# (Apache-2.0) so Qwen can clone them; Kokoro uses the ids directly.
+VOICES = {"heart": "af_heart", "george": "bm_george", "liam": "am_liam", "emma": "bf_emma"}
+REF_TEXT = ("Every book is a long conversation. Some chapters move quickly, and others ask you to slow down "
+            "and listen. Tonight, let's begin at the beginning, and see where the story takes us.")
+SKIP = re.compile(r"(?i)^(cover|title( page)?|copyright.*|(table of )?contents|index|also by.*|praise for.*|"
+                  r"dedication|about the publisher|newsletter.*|sign up.*)$")
+END = tuple('.!?:;…"”’)')
+
+
+def sh(cmd):
+    return subprocess.run(cmd, shell=True, capture_output=True, text=True).stdout.strip()
+
+
+def fmt(sec):
+    sec = int(sec)
+    return f"{sec // 3600}h {sec % 3600 // 60:02d}m" if sec >= 3600 else f"{sec // 60}m {sec % 60:02d}s"
+
+
+def load_json(p, default):
+    try:
+        return json.load(open(p))
+    except Exception:
+        return default
+
+
+def speed(model):
+    return load_json(f"{HOME}/speed.json", {}).get(model) or MODELS[model]["cps"]
+
+
+def cached(repo):
+    return os.path.isdir(os.path.expanduser(f"~/.cache/huggingface/hub/models--{repo.replace('/', '--')}/snapshots"))
+
+
+def sysinfo():
+    ram = int(sh("sysctl -n hw.memsize") or 0) / 2**30
+    return dict(chip=sh("sysctl -n machdep.cpu.brand_string"), ram=ram, arm=platform.machine() == "arm64",
+                macos=platform.mac_ver()[0], disk=shutil.disk_usage(os.path.expanduser("~")).free / 1e9)
+
+
+def pick_model(ram):
+    return "qwen-1.7b" if ram >= 24 else "qwen-0.6b" if ram >= 16 else "kokoro"
+
+
+def current_model(args_model=None):
+    return args_model or load_json(f"{HOME}/config.json", {}).get("model") or pick_model(sysinfo()["ram"])
+
+
+def plan_text(model, s):
+    m = MODELS[model]
+    deps = 0 if os.path.exists(VENV_PY) else DEPS_GB
+    dl = deps + (0 if cached(m["repo"]) else m["gb"])
+    cps = speed(model)
+    lines = [f"Model:     {model}  ({m['about']})",
+             f"Download:  {dl:.1f} GB  (Python packages {deps:.1f} GB{', installed' if not deps else ''}"
+             f" + model {m['gb']} GB{', already downloaded' if cached(m['repo']) else ''})",
+             f"Speed:     ~{cps:.0f} characters/sec on this class of Mac"
+             f" ({cps / 16:.1f}x real time; 1 hour of audio ≈ {fmt(57600 / cps)})",
+             "ETA:       " + ", ".join(f"{n} ≈ {fmt(c / cps)}" for n, c in
+                                       (("short book (200 pages)", 400_000), ("typical (350 pages)", 700_000)))]
+    if s["disk"] < dl + 2:
+        lines.append(f"WARNING:   only {s['disk']:.0f} GB free; need ~{dl + 2:.0f} GB (download + working space)")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- doctor / setup
+def doctor(args):
+    s = sysinfo()
+    ok = lambda b: "ok " if b else "!! "
+    print(f"{ok(s['arm'])}Chip:      {s['chip']}" + ("" if s["arm"] else "  (Apple Silicon required for MLX)"))
+    print(f"{ok(s['ram'] >= 8)}RAM:       {s['ram']:.0f} GB")
+    print(f"{ok(s['disk'] > 6)}Disk free: {s['disk']:.0f} GB")
+    print(f"{ok(True)}macOS:     {s['macos']}")
+    for tool, need, hint in (("uv", True, "brew install uv"), ("ffmpeg", True, "brew install ffmpeg"),
+                             ("swift", False, "xcode-select --install (better PDF text)"),
+                             ("pdftotext", False, "brew install poppler (PDF fallback)")):
+        p = shutil.which(tool)
+        print(f"{ok(p or not need)}{tool + ':':10} {p or 'missing -> ' + hint}")
+    print(f"{ok(os.path.exists(VENV_PY))}Python env: {HOME}/venv " +
+          ("ready" if os.path.exists(VENV_PY) else "not installed (run: ./makeaudiobooks setup)"))
+    model = args.model or pick_model(s["ram"])
+    print(f"\nRecommended for {s['ram']:.0f} GB RAM:\n" + plan_text(model, s))
+    print("\nOther options (--model):")
+    for k, m in MODELS.items():
+        if k != model:
+            print(f"  {k:10} {m['about']}; {m['gb']} GB; ~{speed(k):.0f} chars/s")
+    if args.bench:
+        bench(model)
+
+
+def setup(args):
+    s = sysinfo()
+    if not s["arm"]:
+        sys.exit("makeaudiobooks needs an Apple Silicon Mac (MLX).")
+    for t in ("uv", "ffmpeg"):
+        if not shutil.which(t):
+            sys.exit(f"Missing {t}. Install it with: brew install {t}")
+    model = args.model or pick_model(s["ram"])
+    print(plan_text(model, s))
+    if not args.yes and input("\nDownload and install now? [y/N] ").strip().lower() not in ("y", "yes"):
+        sys.exit("Cancelled. Nothing was downloaded.")
+    os.makedirs(HOME, exist_ok=True)
+    if not os.path.exists(VENV_PY):
+        subprocess.run(["uv", "venv", "-q", "-p", "3.12", f"{HOME}/venv"], check=True)
+    pkgs = [MLX_AUDIO] + (["misaki[en]"] if model == "kokoro" else [])
+    subprocess.run(["uv", "pip", "install", "-p", VENV_PY, *pkgs], check=True)
+    subprocess.run([VENV_PY, "-c", f"from huggingface_hub import snapshot_download; snapshot_download('{MODELS[model]['repo']}')"],
+                   check=True)
+    cfg = load_json(f"{HOME}/config.json", {}) | {"model": model}
+    json.dump(cfg, open(f"{HOME}/config.json", "w"))
+    print(f"\nReady. Model: {model}. Try: ./makeaudiobooks convert book.pdf --dry-run")
+
+
+def in_venv():
+    try:
+        import mlx_audio  # noqa: F401
+        return True
+    except ImportError:
+        if not os.path.exists(VENV_PY):
+            sys.exit("Not set up yet. Run: ./makeaudiobooks setup")
+        os.execv(VENV_PY, [VENV_PY, os.path.realpath(__file__), *sys.argv[1:]])
+
+
+def bench(model):
+    in_venv()
+    eng = Engine(model)
+    text = ("On the outskirts of a quiet town lived a teacher who believed that the world was simple, and that "
+            "anyone could be happy, starting today. A young man who doubted this went to see him one evening, "
+            "determined to prove him wrong. They talked until the lamps burned low.")
+    eng.run([("heart", text)])  # warm-up
+    n = 1 if model == "kokoro" else eng.batch
+    t = time.time()
+    eng.run([("heart", text)] * n)
+    cps = len(text) * n / (time.time() - t)
+    json.dump(load_json(f"{HOME}/speed.json", {}) | {model: round(cps, 1)}, open(f"{HOME}/speed.json", "w"))
+    print(f"Benchmark {model}: {cps:.1f} characters/sec (saved; ETAs now use this)")
+
+
+# ---------------------------------------------------------------- text extraction
+def vocab(text):
+    words = set(open("/usr/share/dict/web2").read().lower().split()) if os.path.exists("/usr/share/dict/web2") else set()
+    return words | set(re.findall(r"[a-z]+", text.lower()))
+
+
+SUFFIXES = ("s", "es", "ed", "d", "ing", "ly", "er", "ers", "ness", "ment", "ments", "ies", "ied", "ive", "ively", "ity", "ation")
+
+
+def stem_len(w, V):
+    w = w.lower()
+    if w in V:
+        return 99
+    return max([len(w) - len(s) for s in SUFFIXES if w.endswith(s) and len(w) > len(s) + 2 and w[:-len(s)] in V] or [0])
+
+
+def repair(text, V):
+    """Fix PDFKit ligature holes (\\x00 -> fi/fl/ff/ffi/ffl) and split letters ('Y es' -> 'Yes')."""
+    def lig(m):
+        return max(((stem_len(m[1] + l + m[2], V), m[1] + l + m[2]) for l in ("fi", "fl", "ff", "ffi", "ffl")),
+                   key=lambda x: x[0])[1]
+    text = re.sub(r"([A-Za-z]*)\x00([A-Za-z]*)", lig, text)
+    text = re.sub(r"\b([A-Z]) ([a-z]+)\b", lambda m: m[1] + m[2] if m[1] in "TYWVPFK" or m[1] not in "AI" and stem_len(m[1] + m[2], V) else m[0], text)
+    text = re.sub(r"(\w)\s*(['’])\s+(s|t|re|ve|ll|d|m)\b|(\w) (['’])(s|t|re|ve|ll|d|m)\b", lambda m: "".join(filter(None, m.groups())), text)  # That’ s -> That’s
+    text = re.sub(r"(\w) ’(?!\w)", r"\1’", text)
+    text = re.sub(r"“\s+", "“", text)
+    return re.sub(r"\s+([”,.;:!?])", r"\1", text)
+
+
+def strip_running(pages):
+    """Drop page numbers and running headers/footers (lines that repeat at page edges)."""
+    key = lambda l: re.sub(r"\d+", "#", l.strip().lower())
+    edges = [[l for l in p.split("\n") if l.strip()] for p in pages]
+    cnt = collections.Counter(k for ls in edges for k in {key(l) for l in ls[:2] + ls[-2:] if len(l) < 90})
+    junk = {k for k, n in cnt.items() if n >= max(4, len(pages) // 25)}
+    out = []
+    for ls in edges:
+        keep = [l for i, l in enumerate(ls)
+                if not ((i < 2 or i >= len(ls) - 2) and (key(l) in junk or re.fullmatch(r"\s*([\divxlc]+|page \d+)\s*", l, re.I)))]
+        out.append("\n".join(keep))
+    return out
+
+
+def norm(s):
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def find_heading(page, title):
+    """Line index where a heading matching title starts on this page (or None)."""
+    cands = [norm(c) for c in (title, title.split(":")[-1]) if len(norm(c)) >= 4]
+    for i, l in enumerate(page.split("\n")[:15]):
+        n = norm(l)
+        if len(n) >= 4 and any(n in c or c in n for c in cands):
+            return i
+    return None
+
+
+def split_at(pages, marks):
+    """marks: [(title, page)] sorted -> chapters [{title, lines}] cut at the heading line when found."""
+    chapters = []
+    for k, (title, pg) in enumerate(marks):
+        start = find_heading(pages[pg], title) or 0
+        nxt_title, nxt_pg = marks[k + 1] if k + 1 < len(marks) else (None, len(pages))
+        end = find_heading(pages[nxt_pg], nxt_title) if nxt_title else None
+        body = pages[pg].split("\n")[start:] if nxt_pg != pg else pages[pg].split("\n")[start:end]
+        for p in pages[pg + 1:nxt_pg]:
+            body += p.split("\n")
+        if nxt_title and nxt_pg != pg and end:
+            body += pages[nxt_pg].split("\n")[:end]
+        nt = norm(title)
+        while body and (not body[0].strip() or (norm(body[0]) and norm(body[0]) in nt)):
+            body.pop(0)  # heading lines are spoken from the title instead
+        chapters.append({"title": title.strip(), "lines": body})
+    return chapters
+
+
+HEAD = re.compile(r"(?i)^(chapter|part|book|prologue|epilogue|introduction|preface|foreword|afterword|conclusion)\b")
+
+
+def detect_marks(pages):
+    # 1) contents page: titles that later show up as page headings
+    for i, p in enumerate(pages[:25]):
+        if re.search(r"(?im)^\s*(table of )?contents\s*$", p):
+            titles = [re.sub(r"[\s.·…]*\d{1,4}$", "", l.strip()) for l in (p + "\n" + pages[i + 1]).split("\n")]
+            marks, after = [], i + 1
+            for t in titles:
+                if 3 <= len(t) <= 90 and not re.fullmatch(r"(?i)(table of )?contents", t):
+                    hit = next((j for j in range(after, len(pages)) if find_heading("\n".join(pages[j].split("\n")[:6]), t) is not None), None)
+                    if hit is not None:
+                        marks.append((t, hit)); after = hit
+            if len(marks) >= 2:
+                return marks
+    # 2) "Chapter 3" style headings at the top of a page
+    marks = []
+    for j, p in enumerate(pages):
+        top = [l.strip() for l in p.split("\n") if l.strip()][:3]
+        for k, l in enumerate(top):
+            if HEAD.match(l) and len(l) < 70:
+                t = l + (": " + top[k + 1] if k + 1 < len(top) and len(l) < 15 and len(top[k + 1]) < 60 else "")
+                marks.append((t, j)); break
+    if len(marks) >= 2:
+        return marks
+    # 3) fixed-size parts
+    return [(f"Part {n + 1}", j) for n, j in enumerate(range(0, len(pages), 25))]
+
+
+def load_pdf(path, work):
+    js, cover = f"{work}/pdf.json", f"{work}/cover.png"
+    r = subprocess.run(["swift", f"{ROOT}/extract.swift", path, js, cover], capture_output=True, text=True) \
+        if shutil.which("swift") else None
+    if r and r.returncode == 0:
+        d = json.load(open(js))
+    elif shutil.which("pdftotext"):
+        d = {"pages": sh(f"pdftotext -enc UTF-8 '{path}' -").split("\f"), "outline": [], "title": "", "author": ""}
+    else:
+        sys.exit("Cannot read PDF: install Xcode command line tools (swift) or poppler (pdftotext).")
+    pages = d["pages"]
+    if not sum(len(p.strip()) for p in pages):
+        sys.exit("This PDF has no text layer (scanned images). OCR it first, e.g. with `ocrmypdf`.")
+    V = vocab(" ".join(pages).replace("\x00", ""))
+    pages = strip_running([repair(p, V) for p in pages])
+    marks = sorted({(t, pg) for t, pg, _ in d["outline"] if t.strip()}, key=lambda x: x[1]) or detect_marks(pages)
+    title = d["title"] or os.path.splitext(os.path.basename(path))[0]
+    return dict(title=title, author=d["author"], chapters=split_at(pages, marks), V=V,
+                cover=cover if os.path.exists(cover) else None)
+
+
+def load_epub(path, work):
+    z = zipfile.ZipFile(path)
+    opf_path = re.search(r'full-path="([^"]+)"', z.read("META-INF/container.xml").decode())[1]
+    opf, base = z.read(opf_path).decode("utf-8", "ignore"), os.path.dirname(opf_path)
+    items = {}
+    for tag in re.findall(r"<item\b[^>]*>", opf):
+        a = dict(re.findall(r'([\w-]+)="([^"]*)"', tag))
+        items[a.get("id")] = a
+    meta = lambda k: html.unescape((re.search(rf"(?s)<dc:{k}[^>]*>(.*?)</dc:{k}>", opf) or [None, ""])[1]).strip()
+    cover = None
+    cid = next((i for i, a in items.items() if "cover-image" in a.get("properties", "")), None) or \
+        (re.search(r'<meta[^>]*name="cover"[^>]*content="([^"]+)"', opf) or [None, None])[1]
+    if cid in items and items[cid].get("media-type", "").startswith("image/"):
+        cover = f"{work}/cover" + os.path.splitext(items[cid]["href"])[1]
+        open(cover, "wb").write(z.read(os.path.normpath(os.path.join(base, items[cid]["href"]))))
+    chapters = []
+    for idref in re.findall(r'<itemref\b[^>]*idref="([^"]+)"', opf):
+        h = z.read(os.path.normpath(os.path.join(base, items[idref]["href"]))).decode("utf-8", "ignore")
+        body = re.sub(r"(?s)<(head|script|style)[^>]*>.*?</\1>", "", h)
+        hm = re.search(r"(?s)<h[1-3][^>]*>(.*?)</h[1-3]>", body)
+        title = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", hm[1]))).strip() if hm else ""
+        if hm:
+            body = body.replace(hm[0], "", 1)
+        text = html.unescape(re.sub(r"<[^>]+>", " ", re.sub(r"(?i)</p>|<br\s*/?>|</h\d>|</div>|</li>", "\n\n", body)))
+        lines = [re.sub(r"[ \t\xa0]+", " ", l).strip() for l in text.split("\n")]
+        if sum(len(l) for l in lines) < 100:
+            continue
+        if title or not chapters:
+            chapters.append({"title": title or "Opening", "lines": lines})
+        else:
+            chapters[-1]["lines"] += [""] + lines  # untitled file continues the previous chapter
+    allt = " ".join(" ".join(c["lines"]) for c in chapters)
+    return dict(title=meta("title") or os.path.basename(path), author=meta("creator"), chapters=chapters,
+                V=vocab(allt), cover=cover)
+
+
+def load_txt(path, work):
+    lines = open(path, encoding="utf-8", errors="ignore").read().split("\n")
+    chapters = [{"title": "Opening", "lines": []}]
+    for l in lines:
+        if HEAD.match(l.strip()) and len(l.strip()) < 70:
+            chapters.append({"title": l.strip(), "lines": []})
+        else:
+            chapters[-1]["lines"].append(l)
+    chapters = [c for c in chapters if sum(len(l) for l in c["lines"]) > 50]
+    return dict(title=os.path.splitext(os.path.basename(path))[0], author="", chapters=chapters,
+                V=vocab(" ".join(lines)), cover=None)
+
+
+# ---------------------------------------------------------------- speakers + segments
+SPK = re.compile(r"^([A-Z][A-Za-z.'’ -]{0,30}?):\s+(?=\S)")
+NOT_SPK = {"note", "chapter", "part", "figure", "table", "step", "tip", "warning", "source", "example", "summary",
+           "answer", "question", "lesson", "rule", "update", "edit", "date", "subject", "re", "ps", "p.s"}
+
+
+def find_speakers(chapters):
+    cnt = collections.Counter(m[1].strip() for c in chapters for l in c["lines"] if (m := SPK.match(l.strip())))
+    return [n for n, k in cnt.most_common(8) if k >= 5 and n.lower() not in NOT_SPK]
+
+
+def join(a, b, V):
+    if a.endswith("-") and not a.endswith(" -"):
+        w = re.findall(r"[A-Za-z]+$", a[:-1]); x = re.match(r"[A-Za-z]+", b)
+        return a[:-1] + b if w and x and (w[0] + x[0]).lower() in V else a + b
+    return a + b if a.endswith(("—", "–", "/")) else f"{a} {b}"
+
+
+def segments(ch, speakers, cast, V):
+    """Chapter lines -> [(voice, text)]: narrator by default; NAME: lines switch to that speaker's voice;
+    a short unpunctuated line between paragraphs is a heading (narrator, followed by narration)."""
+    segs, who = [["narrator", ch["title"].rstrip(".") + "."]], "narrator"
+    for raw in ch["lines"]:
+        l = raw.strip()
+        if not l:
+            if segs[-1][1] and not segs[-1][1].endswith("\n"):
+                segs[-1][1] += "\n"
+            continue
+        m = SPK.match(l)
+        if m and m[1].strip() in speakers:
+            who = m[1].strip(); segs.append([who, l[m.end():]]); continue
+        prev = segs[-1][1].rstrip()
+        if len(l) < 60 and not l.endswith(END) and l[:1].isupper() and prev.endswith(END) and not re.fullmatch(r"[\W\d]+", l):
+            who = "narrator"; segs.append(["narrator", l + "."]); continue
+        if segs[-1][0] == who:
+            segs[-1][1] = join(segs[-1][1].rstrip(" "), l, V) if not segs[-1][1].endswith("\n") else segs[-1][1] + l
+        else:
+            segs.append([who, l])
+    voices = list(VOICES)
+    vmap = {"narrator": cast.get("narrator", voices[0])}
+    for i, s in enumerate(speakers):
+        vmap[s] = cast.get(s.lower(), voices[1 + i % (len(voices) - 1)])
+    clean = lambda t: re.sub(r"\s+", " ", t.replace("\x00", "")).strip()
+    return [(vmap[w], clean(t)) for w, t in segs if re.search(r"[A-Za-z0-9]", t)], vmap
+
+
+def chunks(text, maxc):
+    sents = re.split(r"(?<=[.!?…])[\"”’)]?\s+", text)
+    parts = []
+    for s in sents:
+        while len(s) > maxc:  # very long sentence: break at a comma/semicolon, else a space
+            cut = max(s.rfind(", ", 0, maxc), s.rfind("; ", 0, maxc), s.rfind(" ", 0, maxc // 2 * 2))
+            parts.append(s[:cut + 1].strip()); s = s[cut + 1:].strip()
+        parts.append(s)
+    out, cur = [], ""
+    for s in filter(None, parts):
+        if cur and len(cur) + len(s) + 1 > maxc:
+            out.append(cur); cur = ""
+        cur = f"{cur} {s}".strip()
+    return out + ([cur] if cur else [])
+
+
+# ---------------------------------------------------------------- TTS
+class Engine:
+    def __init__(self, model, clone=None):
+        import mlx.core as mx
+        from mlx_audio.tts.utils import load_model
+        self.model, self.mx = model, mx
+        ram = sysinfo()["ram"]
+        self.batch = 1 if model == "kokoro" else (8 if ram >= 32 else 4 if ram >= 16 else 2)
+        if model == "kokoro":
+            import espeakng_loader  # espeak-ng breaks on long data paths; keep a copy at a short one
+            short = f"{HOME}/espeak-ng-data"
+            if not os.path.isdir(short):
+                shutil.copytree(espeakng_loader.get_data_path(), short)
+            espeakng_loader.get_data_path = lambda: short
+            if clone:
+                sys.exit("Kokoro can't clone voices; use --model qwen-0.6b or qwen-1.7b with --voice.")
+        self.refs = {v: (f"{ROOT}/voices/{v}.wav", REF_TEXT) for v in VOICES}
+        if clone:
+            self.refs["clone"] = clone
+        self.m = load_model(MODELS[model]["repo"])
+
+    def pcm(self, a):
+        import numpy as np
+        return (np.clip(np.array(a, dtype=np.float32), -1, 1) * 32767).astype("<i2").tobytes()
+
+    def run(self, items):
+        """items: [(voice, text)] -> [int16 PCM bytes]"""
+        if self.model == "kokoro":
+            return [b"".join(self.pcm(r.audio) for r in self.m.generate(text=t, voice=VOICES[v], lang_code=VOICES[v][0]))
+                    for v, t in items]
+        if len(items) == 1:
+            (v, t), = items
+            ref, rt = self.refs[v]
+            return [b"".join(self.pcm(r.audio) for r in self.m.generate(text=t, ref_audio=ref, ref_text=rt))]
+        ref, rt = self.refs[items[0][0]]  # callers batch one voice at a time
+        res = list(self.m.batch_generate(texts=[t for _, t in items], ref_audio=ref, ref_text=rt))
+        out = [b""] * len(items)
+        for r in res:
+            out[r.sequence_idx] += self.pcm(r.audio)
+        self.mx.clear_cache()
+        return out
+
+
+# ---------------------------------------------------------------- convert
+def parse_range(spec, n):
+    if not spec:
+        return list(range(n))
+    out = []
+    for part in spec.split(","):
+        a, _, b = part.partition("-")
+        out += range(int(a) - 1, int(b or a))
+    return [i for i in out if 0 <= i < n]
+
+
+def convert(args):
+    src = os.path.abspath(os.path.expanduser(args.book))
+    if not os.path.exists(src):
+        sys.exit(f"Not found: {src}")
+    model = current_model(args.model)
+    if not args.dry_run:
+        in_venv()
+    book_id = hashlib.sha1(open(src, "rb").read()).hexdigest()[:12]
+    work = f"{HOME}/work/{book_id}"
+    os.makedirs(f"{work}/chunks", exist_ok=True)
+    ext = os.path.splitext(src)[1].lower()
+    loader = {".pdf": load_pdf, ".epub": load_epub, ".txt": load_txt, ".md": load_txt}.get(ext)
+    if not loader:
+        sys.exit("Supported: .pdf, .epub, .txt")
+    b = loader(src, work)
+    title, author = args.title or b["title"], args.author or b["author"]
+    speakers = [] if args.no_speakers else find_speakers(b["chapters"])
+    cast = {k.strip().lower(): v.strip() for k, _, v in (p.partition("=") for p in (args.cast or "").split(",") if "=" in p)}
+    if args.voice:
+        cast["narrator"] = "clone"
+    clone = (os.path.abspath(args.voice), args.voice_text) if args.voice else None
+    maxc = MODELS[model]["chunk"]
+    chosen = parse_range(args.chapters, len(b["chapters"]))
+    if not args.chapters:
+        chosen = [i for i in chosen if not SKIP.match(b["chapters"][i]["title"])]
+    plan, vmap = [], {}
+    for i in chosen:
+        segs, vmap = segments(b["chapters"][i], speakers, cast, b["V"])
+        if i == 0 or i == chosen[0] and not args.chapters:
+            segs.insert(0, (vmap["narrator"], f"{title}." + (f" By {author}." if author else "")))
+        plan.append((i, b["chapters"][i]["title"], [(v, c) for v, t in segs for c in chunks(t, maxc)]))
+    total = sum(len(c) for _, _, cs in plan for _, c in cs)
+    cps = speed(model)
+    print(f"{title}" + (f" — {author}" if author else "") + f"\nModel {model}, ~{cps:.0f} chars/s\n")
+    for i, ch in enumerate(b["chapters"]):
+        n = sum(len(c) for j, _, cs in plan if j == i for _, c in cs)
+        mark = "  " if i in chosen else "– "
+        print(f"{mark}{i + 1:3}. {ch['title'][:64]:64} {n:>8,} chars" + (f"  ~{fmt(n / cps)}" if n else "  (skipped)"))
+    if speakers:
+        print("\nVoices: narrator=" + vmap["narrator"] + ", " + ", ".join(f"{s}={vmap[s]}" for s in speakers))
+    print(f"\nTotal {total:,} characters ≈ {total / 16 / 3600:.1f} h of audio; estimated time {fmt(total / cps)}")
+    if args.dry_run:
+        return
+    eng = Engine(model, clone)
+    key = lambda v, t: hashlib.sha1(f"{model}|{v}|{clone and clone[1]}|{t}".encode()).hexdigest()
+    todo = [(v, t) for _, _, cs in plan for v, t in cs if not os.path.exists(f"{work}/chunks/{key(v, t)}.pcm")]
+    todo = list(dict.fromkeys(todo))
+    left = sum(len(t) for _, t in todo)
+    print(f"{len(todo)} chunks to synthesize ({total - left:,} chars cached)\n")
+    t0, done = time.time(), 0
+    by_voice = collections.defaultdict(list)  # a Qwen batch shares one reference voice
+    for v, t in todo:
+        by_voice[v].append((v, t))
+    groups = [g[k:k + eng.batch] for g in by_voice.values() for k in range(0, len(g), eng.batch)]
+    for group in groups:
+        for (v, t), pcm in zip(group, eng.run(group)):
+            p = f"{work}/chunks/{key(v, t)}.pcm"
+            open(p + ".tmp", "wb").write(pcm); os.replace(p + ".tmp", p)
+        done += sum(len(t) for _, t in group)
+        rate = done / (time.time() - t0)
+        print(f"\r  {done / left:6.1%}  {done:,}/{left:,} chars  {rate:.0f} chars/s  ETA {fmt((left - done) / rate)}   ",
+              end="", flush=True)
+    if todo:
+        json.dump(load_json(f"{HOME}/speed.json", {}) | {model: round(rate, 1)}, open(f"{HOME}/speed.json", "w"))
+        print()
+    out = os.path.abspath(os.path.expanduser(args.output)) if args.output else os.path.join(
+        os.path.dirname(src), re.sub(r'[/:*?"<>|]', "-", title) +
+        (f" (chapters {args.chapters})" if args.chapters else "") + ".m4b")
+    assemble(plan, work, key, out, title, author, b["cover"], args.mp3)
+
+
+def assemble(plan, work, key, out, title, author, cover, mp3):
+    gap = lambda s: b"\0\0" * int(SR * s)
+    meta, pos = [";FFMETADATA1", f"title={title}", f"artist={author}", f"album={title}", "genre=Audiobook"], 0
+    esc = lambda s: re.sub(r"([=;#\\\n])", r"\\\1", s)
+    sizes = []
+    for _, ct, cs in plan:
+        n = sum(os.path.getsize(f"{work}/chunks/{key(v, t)}.pcm") + len(gap(0.9 if j == 0 else 0.35)) for j, (v, t) in enumerate(cs))
+        n += len(gap(1.5))
+        meta += ["[CHAPTER]", "TIMEBASE=1/1000", f"START={pos * 1000 // (2 * SR)}", f"END={(pos + n) * 1000 // (2 * SR)}", "title=" + esc(ct)]
+        pos += n
+    open(f"{work}/meta.txt", "w").write("\n".join(meta) + "\n")
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-f", "s16le", "-ar", str(SR), "-ac", "1", "-i", "-", "-i", f"{work}/meta.txt"]
+    if cover:
+        cmd += ["-i", cover, "-map", "2:v", "-c:v", "mjpeg", "-vf", "scale=600:-2", "-disposition:v", "attached_pic"]
+    cmd += ["-map", "0:a", "-map_metadata", "1", "-map_chapters", "1", "-c:a", "aac_at", "-b:a", "64k", "-f", "mp4", out]
+    ff = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    for _, _, cs in plan:
+        for j, (v, t) in enumerate(cs):
+            ff.stdin.write(open(f"{work}/chunks/{key(v, t)}.pcm", "rb").read() + gap(0.9 if j == 0 else 0.35))
+        ff.stdin.write(gap(1.5))
+    ff.stdin.close()
+    if ff.wait():
+        sys.exit("ffmpeg failed")
+    print(f"\nDone: {out}  ({pos / 2 / SR / 3600:.2f} h)")
+    if mp3:
+        m = os.path.splitext(out)[0] + ".mp3"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", out, "-map", "0:a", "-map_chapters", "0",
+                        "-c:a", "libmp3lame", "-b:a", "64k", "-id3v2_version", "3", m], check=True)
+        print(f"Done: {m}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    d = sub.add_parser("doctor", help="check this Mac and recommend a model")
+    d.add_argument("--model", choices=MODELS)
+    d.add_argument("--bench", action="store_true", help="measure real speed on this Mac (after setup)")
+    s = sub.add_parser("setup", help="install the Python env and download the model")
+    s.add_argument("--model", choices=MODELS)
+    s.add_argument("-y", "--yes", action="store_true", help="don't ask before downloading")
+    c = sub.add_parser("convert", help="turn a PDF/EPUB/TXT into an audiobook")
+    c.add_argument("book")
+    c.add_argument("-o", "--output", help="output .m4b path (default: next to the book)")
+    c.add_argument("--chapters", help="e.g. 3 or 1-4,7 (numbers from --dry-run)")
+    c.add_argument("--dry-run", action="store_true", help="list chapters, voices and ETA only")
+    c.add_argument("--model", choices=MODELS)
+    c.add_argument("--voice", help="clone the narrator from a short WAV clip (5-20 s, Qwen models)")
+    c.add_argument("--voice-text", help="exact transcript of --voice (improves cloning)")
+    c.add_argument("--cast", help="assign voices, e.g. 'narrator=emma,YOUTH=liam' (voices: " + ", ".join(VOICES) + ")")
+    c.add_argument("--no-speakers", action="store_true", help="one voice for everything")
+    c.add_argument("--mp3", action="store_true", help="also write an MP3 with chapter markers")
+    c.add_argument("--title"); c.add_argument("--author")
+    a = ap.parse_args()
+    {"doctor": doctor, "setup": setup, "convert": convert}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit("\nStopped. Run the same command again to resume where it left off.")

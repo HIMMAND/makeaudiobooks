@@ -1,0 +1,17 @@
+# never commit books, extracted text or generated audio
+*.pdf
+*.epub
+*.txt
+!requirements*.txt
+*.m4b
+*.mp3
+*.m4a
+*.pcm
+*.json.bak
+reference/
+# demo build
+demo/node_modules/
+demo/out/
+demo/public/*.pcm
+.DS_Store
+__pycache__/
